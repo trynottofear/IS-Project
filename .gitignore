@@ -1,7 +1,29 @@
+# Environments
 venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+env/
 .env
+.venv
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller Build Output
+build/
+dist/
+*.spec
+
+# Database
+face_db.sqlite
+*.db
+
+# Temporary Captures & Misc
+capture_*.jpg
 .DS_Store
+*.log
+
+# PyCharm / VSCode / IDEs
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints
