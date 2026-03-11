@@ -6,7 +6,13 @@ import cv2
 
 class FaceProcessor:
     def __init__(self, db_manager):
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda:0')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+        else:
+            self.device = torch.device('cpu')
+            
         print(f"FaceProcessor running on device: {self.device}")
         
         # Initialize MTCNN for face detection (fast, GPU enabled if available)
@@ -60,7 +66,7 @@ class FaceProcessor:
                     embeddings = self.resnet(faces).cpu().numpy()
                 
                 # Fetch all identities to compare against
-                identities = self.db.get_all_identities()
+                identities = self.db.get_all_identities_with_embeddings()
                 
                 # Compare each detected face
                 for box, embedding in zip(boxes, embeddings):
@@ -72,14 +78,20 @@ class FaceProcessor:
                     emb_norm = embedding / (np.linalg.norm(embedding) + 1e-8)
                     
                     for identity in identities:
-                        db_emb = identity['embedding']
-                        db_emb_norm = db_emb / (np.linalg.norm(db_emb) + 1e-8)
+                        identity_best_sim = -1.0
                         
-                        sim = np.dot(emb_norm, db_emb_norm)
-                        
-                        if sim > best_sim:
-                            best_sim = sim
-                            if sim > self.similarity_threshold:
+                        # Compare against all embeddings for this identity
+                        for emb_dict in identity['embeddings']:
+                            db_emb = emb_dict['embedding']
+                            db_emb_norm = db_emb / (np.linalg.norm(db_emb) + 1e-8)
+                            
+                            sim = np.dot(emb_norm, db_emb_norm)
+                            if sim > identity_best_sim:
+                                identity_best_sim = sim
+                                
+                        if identity_best_sim > best_sim:
+                            best_sim = identity_best_sim
+                            if identity_best_sim > self.similarity_threshold:
                                 best_match_name = identity['name']
                                 best_match_category = identity['category']
                                 

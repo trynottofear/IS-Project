@@ -4,254 +4,560 @@ import numpy as np
 from PIL import Image
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLabel, QPushButton, QLineEdit, QComboBox, QFileDialog, QListWidget, QDialog, QMessageBox
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QPushButton, QLineEdit, QComboBox, QFileDialog, QListWidget, QDialog, QMessageBox,
+    QTabWidget, QScrollArea, QFrame, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QFont
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon
 
 from db_manager import DatabaseManager
 from face_pipeline import FaceProcessor
 
+# --- Stylesheet ---
+DARK_THEME_QSS = """
+    QMainWindow, QDialog { background-color: #1e1e2e; color: #cdd6f4; }
+    QLabel { color: #cdd6f4; font-family: 'Segoe UI', Arial, sans-serif; }
+    
+    /* Tabs */
+    QTabWidget::pane { border: 1px solid #313244; background-color: #1e1e2e; }
+    QTabBar::tab { background-color: #181825; color: #a6adc8; padding: 12px 25px; font-weight: bold; border-top-left-radius: 4px; border-top-right-radius: 4px; }
+    QTabBar::tab:selected { background-color: #313244; color: #cdd6f4; }
+    QTabBar::tab:hover { background-color: #45475a; }
+    
+    /* Buttons */
+    QPushButton { 
+        background-color: #89b4fa; color: #11111b; 
+        border-radius: 5px; padding: 8px 15px; font-weight: bold; font-family: 'Segoe UI', Arial, sans-serif;
+    }
+    QPushButton:hover { background-color: #b4befe; }
+    QPushButton:pressed { background-color: #74c7ec; }
+    
+    QPushButton#danger { background-color: #f38ba8; }
+    QPushButton#danger:hover { background-color: #eba0ac; }
+    
+    QPushButton#success { background-color: #a6e3a1; }
+    QPushButton#success:hover { background-color: #94e2d5; }
+    
+    QPushButton#secondary { background-color: #cba6f7; }
+    QPushButton#secondary:hover { background-color: #f5c2e7; }
+    
+    /* Inputs */
+    QLineEdit, QComboBox { 
+        background-color: #181825; color: #cdd6f4; border: 1px solid #313244; 
+        padding: 8px; border-radius: 4px; font-size: 14px;
+    }
+    QLineEdit:focus, QComboBox:focus { border: 1px solid #89b4fa; }
+    QComboBox::drop-down { border: none; }
+    
+    /* Scroll Areas & Lists */
+    QScrollArea { border: none; background-color: transparent; }
+    QScrollBar:vertical { background: #181825; width: 10px; margin: 0px; }
+    QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; min-height: 20px; }
+"""
+
+# --- Threads ---
 class VideoThread(QThread):
-    # Emit processed frame with annotations
     change_pixmap_signal = pyqtSignal(np.ndarray)
     
     def __init__(self, face_processor):
         super().__init__()
         self.face_processor = face_processor
         self._run_flag = True
+        self.cap = None
 
     def run(self):
-        cap = cv2.VideoCapture(0)
+        self.cap = cv2.VideoCapture(0)
         while self._run_flag:
-            ret, frame = cap.read()
+            ret, frame = self.cap.read()
             if ret:
-                # Process frame
+                frame = cv2.flip(frame, 1)
                 results = self.face_processor.process_frame(frame)
-                
-                # Annotate frame
                 for res in results:
                     box = res['box']
                     name = res['name']
                     category = res['category']
                     similarity = res['similarity']
                     
-                    # Set color based on category
                     if category == 'VIP':
-                        color = (0, 255, 0) # Green (BGR in OpenCV)
+                        color = (0, 255, 0)
                     elif category == 'Blacklist':
-                        color = (0, 0, 255) # Red (BGR in OpenCV)
+                        color = (0, 0, 255)
                     else:
-                        color = (128, 128, 128) # Gray (BGR)
+                        color = (128, 128, 128)
                         
                     cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-                    
                     label_text = f"{name} ({category}) - {similarity:.2f}" if name != "Unknown" else "Unknown"
                     cv2.putText(frame, label_text, (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
                 self.change_pixmap_signal.emit(frame)
-        cap.release()
 
     def stop(self):
         self._run_flag = False
         self.wait()
+        if self.cap:
+            self.cap.release()
 
-class AddIdentityDialog(QDialog):
-    def __init__(self, db_manager, face_processor, parent=None):
+class CaptureDialog(QDialog):
+    """ Dialog to capture photo from webcam """
+    captured_image = pyqtSignal(str) # Emits the save path
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Capture Photo")
+        self.setFixedSize(600, 500)
+        
+        layout = QVBoxLayout()
+        self.video_label = QLabel()
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setFixedSize(580, 400)
+        self.video_label.setStyleSheet("background-color: black;")
+        layout.addWidget(self.video_label)
+        
+        self.btn_capture = QPushButton("Take Snapshot")
+        self.btn_capture.setObjectName("success")
+        self.btn_capture.clicked.connect(self.take_snapshot)
+        layout.addWidget(self.btn_capture)
+        
+        self.setLayout(layout)
+        
+        self.cap = cv2.VideoCapture(0)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_frame)
+        self.timer.start(30)
+        
+        self.current_frame = None
+
+    def update_frame(self):
+        ret, frame = self.cap.read()
+        if ret:
+            frame = cv2.flip(frame, 1)
+            self.current_frame = frame.copy()
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            pix = QPixmap.fromImage(qt_img).scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.video_label.setPixmap(pix)
+
+    def take_snapshot(self):
+        if self.current_frame is not None:
+            # Save frame temporarily
+            import tempfile
+            import os
+            temp_path = os.path.join(tempfile.gettempdir(), f"capture_{np.random.randint(1000)}.jpg")
+            cv2.imwrite(temp_path, self.current_frame)
+            self.captured_image.emit(temp_path)
+            self.accept()
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        self.cap.release()
+        event.accept()
+
+class AddEditIdentityDialog(QDialog):
+    def __init__(self, db_manager, face_processor, identity_data=None, parent=None):
         super().__init__(parent)
         self.db = db_manager
         self.face_processor = face_processor
-        self.setWindowTitle("Add Identity")
-        self.setFixedSize(400, 350)
-        self.img_path = None
+        self.identity_data = identity_data # None for new, dict for edit
+        self.setWindowTitle("Manage Identity" if self.identity_data else "Add New Identity")
+        self.setMinimumSize(500, 600)
         
+        # List to hold temporary paths to images before saving
+        self.pending_images = []
+        
+        # UI Setup
         layout = QVBoxLayout()
         
+        form_layout = QHBoxLayout()
         self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("Enter Name")
-        layout.addWidget(self.name_input)
-        
+        self.name_input.setPlaceholderText("Full Name")
+        if self.identity_data:
+            self.name_input.setText(self.identity_data['name'])
+            
         self.category_combo = QComboBox()
         self.category_combo.addItems(["VIP", "Blacklist"])
-        layout.addWidget(self.category_combo)
+        if self.identity_data:
+            self.category_combo.setCurrentText(self.identity_data['category'])
+            
+        form_layout.addWidget(self.name_input, stretch=2)
+        form_layout.addWidget(self.category_combo, stretch=1)
+        layout.addLayout(form_layout)
         
-        self.image_label = QLabel("No Image Selected")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet("border: 1px solid gray; background-color: #313244;")
-        self.image_label.setFixedSize(150, 150)
+        # Images Gallery Setup
+        gallery_label = QLabel("Reference Photos")
+        font = QFont()
+        font.setBold(True)
+        gallery_label.setFont(font)
+        layout.addWidget(gallery_label)
         
-        # Center the image label
-        img_layout = QHBoxLayout()
-        img_layout.addWidget(self.image_label)
-        img_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addLayout(img_layout)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.gallery_widget = QWidget()
+        self.gallery_layout = QGridLayout(self.gallery_widget)
+        self.scroll_area.setWidget(self.gallery_widget)
+        layout.addWidget(self.scroll_area)
         
         btn_layout = QHBoxLayout()
-        self.btn_select_img = QPushButton("Select Image")
-        self.btn_select_img.clicked.connect(self.select_image)
-        btn_layout.addWidget(self.btn_select_img)
         
-        self.btn_save = QPushButton("Save Identity")
-        self.btn_save.clicked.connect(self.save_identity)
-        self.btn_save.setStyleSheet("background-color: #a6e3a1; color: #11111b;")
-        btn_layout.addWidget(self.btn_save)
+        self.btn_upload = QPushButton("Upload Files")
+        self.btn_upload.clicked.connect(self.upload_images)
+        btn_layout.addWidget(self.btn_upload)
+        
+        self.btn_camera = QPushButton("Take Photo via Camera")
+        self.btn_camera.setObjectName("secondary")
+        self.btn_camera.clicked.connect(self.open_camera_capture)
+        btn_layout.addWidget(self.btn_camera)
         
         layout.addLayout(btn_layout)
+        
+        # Save Button
+        self.btn_save = QPushButton("Save & Enroll")
+        self.btn_save.setObjectName("success")
+        self.btn_save.clicked.connect(self.save_identity)
+        layout.addWidget(self.btn_save)
+        
         self.setLayout(layout)
+        self.refresh_gallery()
 
-    def select_image(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Image Files (*.png *.jpg *.jpeg)")
-        if file_name:
-            self.img_path = file_name
-            pixmap = QPixmap(self.img_path).scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio)
-            self.image_label.setPixmap(pixmap)
+    def upload_images(self):
+        file_names, _ = QFileDialog.getOpenFileNames(self, "Select Images", "", "Image Files (*.png *.jpg *.jpeg)")
+        if file_names:
+            self.pending_images.extend(file_names)
+            self.refresh_gallery()
+
+    def open_camera_capture(self):
+        cap_dialog = CaptureDialog(self)
+        cap_dialog.captured_image.connect(self.add_captured_image)
+        cap_dialog.exec()
+        
+    def add_captured_image(self, path):
+        self.pending_images.append(path)
+        self.refresh_gallery()
+
+    def remove_pending_image(self, index):
+        if 0 <= index < len(self.pending_images):
+            self.pending_images.pop(index)
+            self.refresh_gallery()
+
+    def refresh_gallery(self):
+        # Clear existing
+        for i in reversed(range(self.gallery_layout.count())): 
+            widget = self.gallery_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+                
+        col = 0
+        row = 0
+        
+        # Show existing images if editing
+        if self.identity_data and 'embeddings' in self.identity_data:
+            for emb in self.identity_data['embeddings']:
+                frame = self.create_thumbnail_frame(emb['image_path'], is_existing=True, emb_id=emb['id'])
+                if frame:
+                    self.gallery_layout.addWidget(frame, row, col)
+                    col += 1
+                    if col > 2:
+                        col = 0
+                        row += 1
+
+        # Show pending images
+        for idx, img_path in enumerate(self.pending_images):
+            frame = self.create_thumbnail_frame(img_path, is_existing=False, index=idx)
+            if frame:
+                self.gallery_layout.addWidget(frame, row, col)
+                col += 1
+                if col > 2:
+                    col = 0
+                    row += 1
+
+    def create_thumbnail_frame(self, path, is_existing=False, index=None, emb_id=None):
+        frame = QFrame()
+        frame.setStyleSheet("background-color: #313244; border-radius: 5px;")
+        frame.setFixedSize(140, 160)
+        vbox = QVBoxLayout(frame)
+        
+        img_label = QLabel()
+        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        try:
+            pixmap = QPixmap(path).scaled(120, 120, Qt.AspectRatioMode.KeepAspectRatio)
+            img_label.setPixmap(pixmap)
+        except:
+            img_label.setText("Invalid Image")
+            
+        vbox.addWidget(img_label)
+        
+        # Delete button
+        del_btn = QPushButton("Remove")
+        del_btn.setObjectName("danger")
+        if is_existing:
+            del_btn.clicked.connect(lambda _, eid=emb_id: self.delete_existing_embedding(eid))
+        else:
+            del_btn.clicked.connect(lambda _, i=index: self.remove_pending_image(i))
+            
+        vbox.addWidget(del_btn)
+        return frame
+
+    def delete_existing_embedding(self, emb_id):
+        confirm = QMessageBox.question(self, "Confirm Delete", "Are you sure you want to delete this reference photo?", 
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if confirm == QMessageBox.StandardButton.Yes:
+            self.db.delete_embedding(emb_id)
+            # Refetch data to update ui
+            all_ids = self.db.get_all_identities_with_embeddings()
+            for ident in all_ids:
+                if ident['id'] == self.identity_data['id']:
+                    self.identity_data = ident
+                    break
+            self.refresh_gallery()
 
     def save_identity(self):
         name = self.name_input.text().strip()
         category = self.category_combo.currentText()
         
-        if not name or not self.img_path:
-            QMessageBox.warning(self, "Error", "Please provide a name and select an image.")
+        if not name:
+            QMessageBox.warning(self, "Error", "Name cannot be empty.")
             return
             
-        try:
-            # Load image and get embedding
-            img_pil = Image.open(self.img_path).convert('RGB')
-            embedding = self.face_processor.get_embedding(img_pil)
+        # For new users, we MUST have at least one image. 
+        # For existing users, they MUST have at least one image in total (either pending or existing).
+        total_images = len(self.pending_images)
+        if self.identity_data and 'embeddings' in self.identity_data:
+            total_images += len(self.identity_data['embeddings'])
             
-            if embedding is None:
-                QMessageBox.warning(self, "Error", "No face detected in the image.")
+        if total_images == 0:
+            QMessageBox.warning(self, "Error", "An identity must have at least one reference photo.")
+            return
+
+        # Process new images and get embeddings
+        processed_data = []
+        for path in self.pending_images:
+            try:
+                img_pil = Image.open(path).convert('RGB')
+                embedding = self.face_processor.get_embedding(img_pil)
+                if embedding is not None:
+                    processed_data.append({'path': path, 'embedding': embedding})
+                else:
+                    QMessageBox.warning(self, "Error", f"No face detected in {path}")
+                    return
+            except Exception as e:
+                QMessageBox.critical(self, "Error Processing Image", str(e))
                 return
+
+        # Save to DB
+        try:
+            if self.identity_data:
+                # Update existing identity name and category
+                self.db.update_identity(self.identity_data['id'], name, category)
                 
-            self.db.add_identity(name, category, self.img_path, embedding)
-            QMessageBox.information(self, "Success", f"Identity {name} added successfully.")
+                # Add any new embeddings
+                for item in processed_data:
+                    self.db.add_embedding(self.identity_data['id'], item['path'], item['embedding'])
+                    
+                QMessageBox.information(self, "Success", "Identity updated successfully.")
+            else:
+                self.db.add_identity(name, category, processed_data)
+                QMessageBox.information(self, "Success", f"Identity {name} added successfully.")
             self.accept()
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, "Database Error", str(e))
+
+
+class IdentityTab(QWidget):
+    """ Tab showing all identities in a neat grid """
+    def __init__(self, parent_main_window):
+        super().__init__()
+        self.main_app = parent_main_window
+        self.db = self.main_app.db
+        
+        layout = QVBoxLayout(self)
+        
+        # Toolbar
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("<h2>Registered Identities</h2>"))
+        toolbar.addStretch()
+        
+        self.btn_add = QPushButton("Enrol New Person")
+        self.btn_add.setObjectName("secondary")
+        self.btn_add.clicked.connect(self.open_add_dialog)
+        toolbar.addWidget(self.btn_add)
+        
+        self.btn_refresh = QPushButton("Refresh List")
+        self.btn_refresh.clicked.connect(self.populate_grid)
+        toolbar.addWidget(self.btn_refresh)
+        
+        layout.addLayout(toolbar)
+        
+        # Grid Scroll Area
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.grid = QGridLayout(self.container)
+        self.scroll.setWidget(self.container)
+        layout.addWidget(self.scroll)
+
+    def populate_grid(self):
+        # Clear grid
+        for i in reversed(range(self.grid.count())): 
+            widget = self.grid.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+                
+        identities = self.db.get_all_identities_with_embeddings()
+        
+        col = 0
+        row = 0
+        # Determine number of columns based on width
+        max_cols = max(1, self.scroll.width() // 250)
+        
+        for identity in identities:
+            card = self.create_card(identity)
+            self.grid.addWidget(card, row, col)
+            col += 1
+            if col >= max_cols:
+                col = 0
+                row += 1
+                
+        self.grid.setRowStretch(row + 1, 1) # Push everything up
+
+    def create_card(self, identity):
+        frame = QFrame()
+        frame.setStyleSheet("background-color: #313244; border-radius: 8px;")
+        frame.setFixedSize(220, 260)
+        
+        layout = QVBoxLayout(frame)
+        
+        # Thumbnail (use first embedding if available)
+        img_label = QLabel()
+        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if identity['embeddings'] and len(identity['embeddings']) > 0:
+            path = identity['embeddings'][0]['image_path']
+            try:
+                pixmap = QPixmap(path).scaled(180, 150, Qt.AspectRatioMode.KeepAspectRatio)
+                img_label.setPixmap(pixmap)
+            except:
+                img_label.setText("Image Error")
+        else:
+            img_label.setText("No Images")
+        
+        layout.addWidget(img_label)
+        
+        name_lbl = QLabel(f"<b>{identity['name']}</b>")
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(name_lbl)
+        
+        cat_color = "#a6e3a1" if identity['category'] == "VIP" else "#f38ba8"
+        cat_lbl = QLabel(f"<span style='color:{cat_color}'>{identity['category']}</span> | Photos: {len(identity['embeddings'])}")
+        cat_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(cat_lbl)
+        
+        btn_layout = QHBoxLayout()
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(lambda _, id_data=identity: self.open_edit_dialog(id_data))
+        
+        del_btn = QPushButton("Delete")
+        del_btn.setObjectName("danger")
+        del_btn.clicked.connect(lambda _, iid=identity['id']: self.delete_identity(iid))
+        
+        btn_layout.addWidget(edit_btn)
+        btn_layout.addWidget(del_btn)
+        layout.addLayout(btn_layout)
+        
+        return frame
+
+    def open_add_dialog(self):
+        dlg = AddEditIdentityDialog(self.db, self.main_app.face_processor, parent=self)
+        if dlg.exec():
+            self.populate_grid()
+
+    def open_edit_dialog(self, identity_data):
+        dlg = AddEditIdentityDialog(self.db, self.main_app.face_processor, identity_data=identity_data, parent=self)
+        if dlg.exec():
+            self.populate_grid()
+
+    def delete_identity(self, iid):
+        confirm = QMessageBox.question(self, "Confirm Delete", "Delete this entire person and all their photos from the DB?", 
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if confirm == QMessageBox.StandardButton.Yes:
+            self.db.delete_identity(iid)
+            self.populate_grid()
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Face Recognition CCTV")
-        self.setGeometry(100, 100, 1000, 700)
+        self.setWindowTitle("Face Recognition CCTV Pro")
+        self.setGeometry(100, 100, 1100, 750)
+        self.setStyleSheet(DARK_THEME_QSS)
         
         self.db = DatabaseManager('face_db.sqlite')
         self.face_processor = FaceProcessor(self.db)
         
         self.init_ui()
         
-        self.thread = VideoThread(self.face_processor)
-        self.thread.change_pixmap_signal.connect(self.update_image)
-        self.thread.start()
+        # Stop CV backend until Live Monitor tab opens
+        self.thread = None
 
     def init_ui(self):
-        # Apply dark theme using Catppuccin Mocha colors
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1e1e2e; color: #cdd6f4; }
-            QLabel { color: #cdd6f4; }
-            QPushButton { 
-                background-color: #89b4fa; color: #11111b; 
-                border-radius: 5px; padding: 10px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #b4befe; }
-            QListWidget { background-color: #181825; color: #cdd6f4; border: 1px solid #313244; font-size: 14px; }
-            QLineEdit, QComboBox { 
-                background-color: #181825; color: #cdd6f4; border: 1px solid #313244; 
-                padding: 5px; border-radius: 3px; 
-            }
-        """)
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
         
-        main_widget = QWidget()
-        main_layout = QHBoxLayout()
+        # Tab 1: Live Monitor
+        self.live_tab = QWidget()
+        live_layout = QVBoxLayout(self.live_tab)
         
-        # Left side - Video Feed
-        self.video_label = QLabel(self)
+        self.video_label = QLabel("Camera Offline. Click Start Stream.")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet("background-color: black; border-radius: 10px;")
-        self.video_label.setMinimumSize(640, 480)
-        main_layout.addWidget(self.video_label, stretch=2)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.video_label.setStyleSheet("background-color: black; border-radius: 10px; font-size: 18px;")
+        live_layout.addWidget(self.video_label, stretch=1)
         
-        # Right side - Controls and Lists
-        right_panel = QVBoxLayout()
-        right_panel.setSpacing(15)
+        self.btn_toggle_cam = QPushButton("Start Stream")
+        self.btn_toggle_cam.setObjectName("success")
+        self.btn_toggle_cam.clicked.connect(self.toggle_camera)
+        live_layout.addWidget(self.btn_toggle_cam, alignment=Qt.AlignmentFlag.AlignCenter)
         
-        title = QLabel("CCTV Monitor")
-        font = QFont()
-        font.setPointSize(20)
-        font.setBold(True)
-        title.setFont(font)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        right_panel.addWidget(title)
+        self.tabs.addTab(self.live_tab, "Live Monitor")
         
-        self.btn_add_identity = QPushButton("Add New Identity")
-        self.btn_add_identity.setStyleSheet("background-color: #cba6f7; color: #11111b; border-radius: 5px; padding: 10px; font-weight: bold;")
-        self.btn_add_identity.clicked.connect(self.open_add_dialog)
-        right_panel.addWidget(self.btn_add_identity)
+        # Tab 2: Identity Management
+        self.identities_tab = IdentityTab(self)
+        self.tabs.addTab(self.identities_tab, "Identities & Configuration")
         
-        list_label = QLabel("Current Identities:")
-        font_label = QFont()
-        font_label.setPointSize(12)
-        font_label.setBold(True)
-        list_label.setFont(font_label)
-        right_panel.addWidget(list_label)
-        
-        self.list_identities = QListWidget()
-        right_panel.addWidget(self.list_identities)
-        
-        self.btn_refresh = QPushButton("Refresh List")
-        self.btn_refresh.clicked.connect(self.refresh_list)
-        right_panel.addWidget(self.btn_refresh)
-        
-        self.btn_delete = QPushButton("Delete Selected")
-        self.btn_delete.clicked.connect(self.delete_identity)
-        self.btn_delete.setStyleSheet("background-color: #f38ba8; color: #11111b; border-radius: 5px; padding: 10px; font-weight: bold;")
-        right_panel.addWidget(self.btn_delete)
-        
-        main_layout.addLayout(right_panel, stretch=1)
-        main_widget.setLayout(main_layout)
-        self.setCentralWidget(main_widget)
-        
-        self.refresh_list()
+        # When tab changes, handle grid refresh or camera pause
+        self.tabs.currentChanged.connect(self.on_tab_change)
+
+    def toggle_camera(self):
+        if self.thread and self.thread.isRunning():
+            self.thread.stop()
+            self.thread = None
+            self.btn_toggle_cam.setText("Start Stream")
+            self.btn_toggle_cam.setObjectName("success")
+            self.btn_toggle_cam.setStyleSheet("") # trick to reappply qss
+            self.video_label.clear()
+            self.video_label.setText("Camera Offline.")
+        else:
+            self.thread = VideoThread(self.face_processor)
+            self.thread.change_pixmap_signal.connect(self.update_image)
+            self.thread.start()
+            self.btn_toggle_cam.setText("Stop Stream")
+            self.btn_toggle_cam.setObjectName("danger")
+            self.btn_toggle_cam.setStyleSheet("")
 
     def update_image(self, cv_img):
-        qt_img = self.convert_cv_qt(cv_img)
-        self.video_label.setPixmap(qt_img)
-        
-    def convert_cv_qt(self, cv_img):
         rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
         convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         p = convert_to_Qt_format.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
-        return QPixmap.fromImage(p)
+        self.video_label.setPixmap(QPixmap.fromImage(p))
 
-    def open_add_dialog(self):
-        dlg = AddIdentityDialog(self.db, self.face_processor, self)
-        if dlg.exec():
-            self.refresh_list()
-
-    def refresh_list(self):
-        self.list_identities.clear()
-        identities = self.db.get_all_identities()
-        for idx in identities:
-            display_text = f"[{idx['category']}] {idx['name']} (ID: {idx['id']})"
-            self.list_identities.addItem(display_text)
-
-    def delete_identity(self):
-        selected = self.list_identities.currentItem()
-        if selected:
-            text = selected.text()
-            # Extract ID from text e.g., "[VIP] John (ID: 1)"
-            import re
-            match = re.search(r'\(ID: (\d+)\)', text)
-            if match:
-                identity_id = int(match.group(1))
-                self.db.delete_identity(identity_id)
-                self.refresh_list()
+    def on_tab_change(self, index):
+        if index == 1:
+            self.identities_tab.populate_grid()
 
     def closeEvent(self, event):
-        self.thread.stop()
+        if self.thread and self.thread.isRunning():
+            self.thread.stop()
         event.accept()
 
 if __name__ == '__main__':
