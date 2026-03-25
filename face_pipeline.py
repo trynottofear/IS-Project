@@ -43,11 +43,31 @@ class FaceProcessor:
             return embedding[0].cpu().numpy()
         return None
 
-    def process_frame(self, frame_cv):
+    def extract_faces_and_embeddings(self, frame_cv):
+        """
+        Detects faces and computes embeddings without DB matching.
+        Returns a tuple (boxes, list of embeddings).
+        """
+        rgb_frame = cv2.cvtColor(frame_cv, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(rgb_frame)
+        boxes, probs = self.mtcnn.detect(img_pil)
+        
+        embeddings = []
+        if boxes is not None:
+            faces = self.mtcnn.extract(img_pil, boxes, save_path=None)
+            if faces is not None:
+                faces = faces.to(self.device)
+                with torch.no_grad():
+                    embeddings = self.resnet(faces).cpu().numpy()
+        return boxes if boxes is not None else [], embeddings
+
+    def process_frame(self, frame_cv, threshold=None):
         """
         Process a cv2 frame. Detect faces, compute embeddings, and match with DB.
-        Returns a list of dicts with box, name, category.
+        Returns a list of dicts with box, name, category, identity_id, similarity, embedding.
         """
+        if threshold is None:
+            threshold = self.similarity_threshold
         # Convert BGR to RGB for PIL
         rgb_frame = cv2.cvtColor(frame_cv, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(rgb_frame)
@@ -68,10 +88,10 @@ class FaceProcessor:
                 # Fetch all identities to compare against
                 identities = self.db.get_all_identities_with_embeddings()
                 
-                # Compare each detected face
                 for box, embedding in zip(boxes, embeddings):
                     best_match_name = "Unknown"
                     best_match_category = "Unknown"
+                    best_match_id = None
                     best_sim = -1.0
                     
                     # Normalize embedding for cosine similarity
@@ -91,14 +111,17 @@ class FaceProcessor:
                                 
                         if identity_best_sim > best_sim:
                             best_sim = identity_best_sim
-                            if identity_best_sim > self.similarity_threshold:
+                            if identity_best_sim > threshold:
                                 best_match_name = identity['name']
                                 best_match_category = identity['category']
+                                best_match_id = identity['id']
                                 
                     results.append({
                         'box': [int(b) for b in box],
                         'name': best_match_name,
                         'category': best_match_category,
-                        'similarity': float(best_sim)
+                        'identity_id': best_match_id,
+                        'similarity': float(best_sim),
+                        'embedding': embedding
                     })
         return results
