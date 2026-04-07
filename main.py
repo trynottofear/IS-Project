@@ -673,10 +673,22 @@ class IdentityTab(QWidget):
             self.main_app.refresh_all_grids()
             
     def open_video_processor(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Video File", "", "Video Files (*.mp4 *.avi *.mkv *.mov)")
-        if file_path:
-            from PyQt6.QtWidgets import QProgressDialog
-            dlg = VideoProcessorDialog(file_path, self.main_app.face_processor, self.db, self)
+        msgBox = QMessageBox(self)
+        msgBox.setWindowTitle("Process Faces")
+        msgBox.setText("Where would you like to process faces from?")
+        btn_file = msgBox.addButton("Video File", QMessageBox.ButtonRole.ActionRole)
+        btn_cam = msgBox.addButton("Live Camera", QMessageBox.ButtonRole.ActionRole)
+        msgBox.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msgBox.exec()
+        
+        if msgBox.clickedButton() == btn_file:
+            file_path, _ = QFileDialog.getOpenFileName(self, "Select Video File", "", "Video Files (*.mp4 *.avi *.mkv *.mov)")
+            if file_path:
+                dlg = VideoProcessorDialog(file_path, self.main_app.face_processor, self.db, self)
+                dlg.exec()
+                self.main_app.refresh_all_grids()
+        elif msgBox.clickedButton() == btn_cam:
+            dlg = VideoProcessorDialog(0, self.main_app.face_processor, self.db, self)
             dlg.exec()
             self.main_app.refresh_all_grids()
 
@@ -711,6 +723,7 @@ class VideoProcessorThread(QThread):
     progress = pyqtSignal(int)
     log = pyqtSignal(str)
     finished = pyqtSignal()
+    frame_ready = pyqtSignal(np.ndarray)
     
     def __init__(self, video_path, face_processor, db):
         super().__init__()
@@ -719,6 +732,10 @@ class VideoProcessorThread(QThread):
         self.db = db
         self.save_dir = os.path.join(os.getcwd(), "captured_faces")
         os.makedirs(self.save_dir, exist_ok=True)
+        self.running = True
+        
+    def stop(self):
+        self.running = False
         
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -737,10 +754,13 @@ class VideoProcessorThread(QThread):
         frame_idx = 0
         added_count = 0
         
-        while True:
+        while self.running:
             ret, frame = cap.read()
             if not ret:
                 break
+                
+            if isinstance(self.video_path, int) and frame_idx % 2 == 0:
+                self.frame_ready.emit(frame)
                 
             if frame_idx % frame_interval == 0:
                 boxes, embeddings = self.face_processor.extract_faces_and_embeddings(frame)
@@ -900,33 +920,393 @@ class VideoProcessorThread(QThread):
 class VideoProcessorDialog(QDialog):
     def __init__(self, video_path, face_processor, db, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Processing Video...")
+        self.is_camera = isinstance(video_path, int)
+        self.setWindowTitle("Processing Live Stream..." if self.is_camera else "Processing Video...")
         self.setFixedSize(500, 300)
         
         layout = QVBoxLayout(self)
-        self.lbl_info = QLabel(f"Processing: {os.path.basename(video_path)}")
+        self.lbl_info = QLabel("Processing: Live Camera 0" if self.is_camera else f"Processing: {os.path.basename(video_path)}")
         layout.addWidget(self.lbl_info)
         
+        if self.is_camera:
+            self.video_label = QLabel()
+            self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.video_label.setFixedSize(480, 320)
+            self.video_label.setStyleSheet("background-color: black; border-radius: 5px;")
+            layout.addWidget(self.video_label)
+            self.setFixedSize(520, 650)
+        
         self.progress = QProgressBar()
-        self.progress.setValue(0)
+        if self.is_camera:
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.setValue(0)
         layout.addWidget(self.progress)
         
         self.log_widget = QListWidget()
         layout.addWidget(self.log_widget)
         
-        self.btn_close = QPushButton("Close")
-        self.btn_close.clicked.connect(self.accept)
-        self.btn_close.setEnabled(False)
+        self.btn_close = QPushButton("Stop Capture" if self.is_camera else "Close")
+        if self.is_camera:
+            self.btn_close.clicked.connect(self.stop_capture)
+            self.btn_close.setEnabled(True)
+        else:
+            self.btn_close.clicked.connect(self.accept)
+            self.btn_close.setEnabled(False)
         layout.addWidget(self.btn_close)
         
         self.thread = VideoProcessorThread(video_path, face_processor, db)
         self.thread.progress.connect(self.progress.setValue)
         self.thread.log.connect(self.log_widget.addItem)
         self.thread.finished.connect(self.on_finished)
+        if self.is_camera:
+            self.thread.frame_ready.connect(self.update_image)
         self.thread.start()
         
+    def update_image(self, cv_img):
+        if self.is_camera:
+            frame = cv2.flip(cv_img, 1)
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            p = convert_to_Qt_format.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.video_label.setPixmap(QPixmap.fromImage(p))
+        
+    def stop_capture(self):
+        self.btn_close.setEnabled(False)
+        self.btn_close.setText("Aggregating Data...")
+        self.thread.stop()
+        
     def on_finished(self):
+        if self.is_camera:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
+        self.btn_close.setText("Close")
+        try:
+            self.btn_close.clicked.disconnect()
+        except TypeError:
+            pass
+        self.btn_close.clicked.connect(self.accept)
         self.btn_close.setEnabled(True)
+
+class HybridCaptureThread(QThread):
+    frame_ready = pyqtSignal(np.ndarray, list)
+    progress = pyqtSignal(int)
+    log = pyqtSignal(str)
+    finished_processing = pyqtSignal()
+
+    def __init__(self, face_processor, db):
+        super().__init__()
+        self.face_processor = face_processor
+        self.db = db
+        self.running = True
+        self.running_capture = True
+        self.live_tracks = []
+        self.next_track_id = 1
+        self.save_dir = os.path.join(os.getcwd(), "captured_faces")
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.finished_tracks = []
+        
+    def run(self):
+        self.cap = cv2.VideoCapture(0)
+        while self.running_capture:
+            ret, frame = self.cap.read()
+            if ret:
+                results = self.face_processor.process_frame(frame)
+                current_boxes = [r['box'] for r in results]
+                unmatched_boxes = set(range(len(current_boxes)))
+                
+                target_tracks = []
+                for track in self.live_tracks:
+                    track['misses'] += 1
+                    best_score = 0
+                    best_idx = -1
+                    for i in unmatched_boxes:
+                        score = compute_tracking_score(track['last_box'], current_boxes[i])
+                        if score > best_score:
+                            best_score = score
+                            best_idx = i
+                            
+                    if best_score > 0.4:
+                        res = results[best_idx]
+                        track['last_box'] = current_boxes[best_idx]
+                        track['misses'] = 0
+                        
+                        box = current_boxes[best_idx]
+                        x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), min(frame.shape[1], int(box[2])), min(frame.shape[0], int(box[3]))
+                        if x2 - x1 >= 10 and y2 - y1 >= 10:
+                            track['images'].append(frame[y1:y2, x1:x2])
+                            track['embeddings'].append(res['embedding'])
+                            
+                        if 'history' not in track:
+                            track['history'] = []
+                        if res['category'] != 'Unknown' and res['similarity'] > 0.65:
+                            pred = (res['identity_id'], res['name'], res['category'])
+                        else:
+                            pred = (None, 'Unknown', 'Unknown')
+                            
+                        track['history'].append(pred)
+                        if len(track['history']) > 30:
+                            track['history'].pop(0)
+                        
+                        known_preds = [p for p in track['history'] if p[1] != 'Unknown']
+                        if known_preds:
+                            votes = {}
+                            for p in known_preds:
+                                votes[p] = votes.get(p, 0) + 1
+                            most_common_pred = max(votes.items(), key=lambda x: x[1])
+                            best_pred, count = most_common_pred
+                            if track['name'] == 'Unknown':
+                                if count >= 3:
+                                    track['identity_id'] = best_pred[0]
+                                    track['name'] = best_pred[1]
+                                    track['category'] = best_pred[2]
+                            else:
+                                if best_pred[1] != track['name'] and count >= 5:
+                                    track['identity_id'] = best_pred[0]
+                                    track['name'] = best_pred[1]
+                                    track['category'] = best_pred[2]
+                                    
+                        unmatched_boxes.remove(best_idx)
+                    
+                    if track['misses'] < 5:
+                        target_tracks.append(track)
+                    else:
+                        self.finished_tracks.append(track)
+                        
+                for i in unmatched_boxes:
+                    res = results[i]
+                    if res['category'] != 'Unknown' and res['similarity'] > 0.65:
+                        pred = (res['identity_id'], res['name'], res['category'])
+                    else:
+                        pred = (None, 'Unknown', 'Unknown')
+                        
+                    box = current_boxes[i]
+                    x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), min(frame.shape[1], int(box[2])), min(frame.shape[0], int(box[3]))
+                    track_img = frame[y1:y2, x1:x2] if x2 - x1 >= 10 and y2 - y1 >= 10 else None
+                    if track_img is not None:
+                        target_tracks.append({
+                            'id': self.next_track_id,
+                            'last_box': current_boxes[i],
+                            'misses': 0,
+                            'identity_id': None,
+                            'name': 'Unknown',
+                            'category': 'Unknown',
+                            'images': [track_img],
+                            'embeddings': [res['embedding']],
+                            'history': [pred]
+                        })
+                        self.next_track_id += 1
+                    
+                self.live_tracks = target_tracks
+                display_data = []
+                for t in self.live_tracks:
+                    if t['misses'] == 0:
+                        display_data.append({
+                            'box': t['last_box'],
+                            'name': t['name'],
+                            'category': t['category']
+                        })
+                        
+                self.frame_ready.emit(frame, display_data)
+            else:
+                break
+                
+        if self.cap:
+            self.cap.release()
+            
+        if self.running:
+            self.progress.emit(10)
+            self.finished_tracks.extend(self.live_tracks)
+            self.log.emit(f"Tracking concluded. Aggregating {len(self.finished_tracks)} tracks into Database...")
+            
+            known_identities = self.db.get_all_identities_with_embeddings()
+            unmatched_tracks = []
+            added_count = 0
+            
+            for track in self.finished_tracks:
+                if len(track['embeddings']) < 3:
+                    continue
+                    
+                best_match_id = None
+                best_match_name = None
+                best_sim_global = -1.0
+                
+                total_frames_in_track = len(track['images'])
+                keep_count = min(5, total_frames_in_track)
+                indices_to_save = np.linspace(0, total_frames_in_track - 1, keep_count, dtype=int)
+                
+                for db_ident in known_identities:
+                    for db_emb_dict in db_ident['embeddings']:
+                        db_emb = db_emb_dict['embedding']
+                        db_emb_norm = db_emb / (np.linalg.norm(db_emb) + 1e-8)
+                        for trk_emb in track['embeddings']:
+                            trk_emb_norm = trk_emb / (np.linalg.norm(trk_emb) + 1e-8)
+                            sim = np.dot(trk_emb_norm, db_emb_norm)
+                            if sim > best_sim_global:
+                                best_sim_global = sim
+                                if sim > 0.75:
+                                    best_match_id = db_ident['id']
+                                    best_match_name = db_ident['name']
+                                    
+                if best_match_id is not None:
+                    for idx in indices_to_save:
+                        filename = f"hybrid_track_{track['id']}_{idx}_{np.random.randint(10000)}.jpg"
+                        filepath = os.path.join(self.save_dir, filename)
+                        cv2.imwrite(filepath, track['images'][idx])
+                        self.db.add_embedding(best_match_id, filepath, track['embeddings'][idx])
+                        added_count += 1
+                    self.log.emit(f"Track {track['id']} -> Grouped into: {best_match_name} ({keep_count} photos)")
+                else:
+                    unmatched_tracks.append({'track': track, 'indices': indices_to_save})
+                    
+            grouped_unmatched = []
+            for ut_dict in unmatched_tracks:
+                track = ut_dict['track']
+                merged = False
+                for group in grouped_unmatched:
+                    group_sim = -1.0
+                    for g_ut_dict in group:
+                        g_track = g_ut_dict['track']
+                        for e1 in track['embeddings']:
+                            e1_n = e1 / (np.linalg.norm(e1) + 1e-8)
+                            for e2 in g_track['embeddings']:
+                                e2_n = e2 / (np.linalg.norm(e2) + 1e-8)
+                                sim = np.dot(e1_n, e2_n)
+                                if sim > group_sim:
+                                    group_sim = sim
+                    if group_sim > 0.72:
+                        group.append(ut_dict)
+                        merged = True
+                        break
+                if not merged:
+                    grouped_unmatched.append([ut_dict])
+                    
+            for group in grouped_unmatched:
+                rand_id = f"Unknown_Hybrid_{np.random.randint(1000, 9999)}"
+                images_data = []
+                for ut_dict in group:
+                    track = ut_dict['track']
+                    indices_to_save = ut_dict['indices']
+                    for idx in indices_to_save:
+                        filename = f"hybrid_track_{track['id']}_{idx}_{np.random.randint(10000)}.jpg"
+                        filepath = os.path.join(self.save_dir, filename)
+                        cv2.imwrite(filepath, track['images'][idx])
+                        images_data.append({'path': filepath, 'embedding': track['embeddings'][idx]})
+                if images_data:
+                    self.db.add_identity(rand_id, 'Unknown', images_data)
+                    added_count += len(images_data)
+                self.log.emit(f"Clustered {len(group)} Tracks -> Generated new Unknown: {rand_id} ({len(images_data)} photos)")
+                
+            self.progress.emit(100)
+            self.log.emit(f"Capture Complete! Saved {added_count} facial embeddings.")
+            self.finished_processing.emit()
+            
+    def stop_capture(self):
+        self.running_capture = False
+        
+    def hard_stop(self):
+        self.running = False
+        self.running_capture = False
+        self.wait()
+
+class HybridCaptureTab(QWidget):
+    def __init__(self, main_app):
+        super().__init__()
+        self.main_app = main_app
+        layout = QVBoxLayout(self)
+        
+        self.video_label = QLabel("Camera Offline. Click Start Detection & Capture.")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.video_label.setStyleSheet("background-color: black; border-radius: 10px; font-size: 18px;")
+        layout.addWidget(self.video_label, stretch=1)
+        
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        layout.addWidget(self.progress)
+        
+        self.log_widget = QListWidget()
+        self.log_widget.setFixedHeight(100)
+        self.log_widget.hide()
+        layout.addWidget(self.log_widget)
+        
+        self.btn_toggle = QPushButton("Start Detection & Capture")
+        self.btn_toggle.setObjectName("success")
+        self.btn_toggle.clicked.connect(self.toggle_capture)
+        layout.addWidget(self.btn_toggle, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        self.thread = None
+        
+    def update_hybrid_image(self, cv_img, display_data):
+        frame = cv2.flip(cv_img, 1)
+        h, w, ch = frame.shape
+        for res in display_data:
+            box = res['box']
+            name = res['name']
+            category = res['category']
+            
+            x1 = w - box[2]
+            x2 = w - box[0]
+            y1 = box[1]
+            y2 = box[3]
+            
+            if category == 'VIP':
+                color = (0, 255, 0)
+            elif category == 'Blacklist':
+                color = (0, 0, 255)
+            else:
+                color = (128, 128, 128)
+                
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            label_text = f"{name} ({category})"
+            cv2.putText(frame, label_text, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        p = convert_to_Qt_format.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.video_label.setPixmap(QPixmap.fromImage(p))
+        
+    def toggle_capture(self):
+        if self.thread and self.thread.isRunning():
+            if self.thread.running_capture:
+                # Stop capture and start aggregation
+                self.btn_toggle.setText("Aggregating Data (Please wait...)")
+                self.btn_toggle.setEnabled(False)
+                self.progress.show()
+                self.progress.setRange(0, 0)
+                self.log_widget.show()
+                self.thread.stop_capture()
+        else:
+            self.thread = HybridCaptureThread(self.main_app.face_processor, self.main_app.db)
+            self.thread.frame_ready.connect(self.update_hybrid_image)
+            self.thread.progress.connect(self.progress.setValue)
+            self.thread.log.connect(self.log_widget.addItem)
+            self.thread.finished_processing.connect(self.on_finished)
+            self.thread.start()
+            self.log_widget.clear()
+            self.log_widget.hide()
+            self.progress.hide()
+            self.btn_toggle.setText("Finish & Save Data")
+            self.btn_toggle.setObjectName("danger")
+            self.btn_toggle.setStyleSheet("")
+            
+    def on_finished(self):
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
+        self.btn_toggle.setEnabled(True)
+        self.btn_toggle.setText("Start Detection & Capture")
+        self.btn_toggle.setObjectName("success")
+        self.btn_toggle.setStyleSheet("")
+        self.main_app.refresh_all_grids()
+        
+    def stop(self):
+        if self.thread and self.thread.isRunning():
+            self.thread.hard_stop()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -963,6 +1343,9 @@ class MainWindow(QMainWindow):
         live_layout.addWidget(self.btn_toggle_cam, alignment=Qt.AlignmentFlag.AlignCenter)
         
         self.tabs.addTab(self.live_tab, "Live Monitor")
+        
+        self.hybrid_tab = HybridCaptureTab(self)
+        self.tabs.addTab(self.hybrid_tab, "Detection + Capture")
         
         # Tab 2: Identity Management
         self.identities_tab = IdentityTab(self, filter_categories=["VIP", "Blacklist"])
@@ -1116,6 +1499,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.video_thread and self.video_thread.isRunning():
             self.video_thread.stop()
+        if hasattr(self, 'hybrid_tab'):
+            self.hybrid_tab.stop()
         event.accept()
 
 if __name__ == '__main__':
