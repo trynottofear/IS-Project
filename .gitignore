@@ -18,6 +18,7 @@ face_db.sqlite
 
 # Temporary Captures & Misc
 capture_*.jpg
+captured_faces/
 .DS_Store
 *.log
 
