@@ -561,11 +561,6 @@ class IdentityTab(QWidget):
         toolbar.addStretch()
         
         if "VIP" in self.filter_categories:
-            self.btn_batch = QPushButton("Process Video")
-            self.btn_batch.setStyleSheet("background-color: #f9e2af; color: #11111b; font-weight: bold; padding: 8px 15px; border-radius: 5px;")
-            self.btn_batch.clicked.connect(self.open_video_processor)
-            toolbar.addWidget(self.btn_batch)
-            
             self.btn_add = QPushButton("Enrol New Person")
             self.btn_add.setObjectName("secondary")
             self.btn_add.clicked.connect(self.open_add_dialog)
@@ -581,6 +576,7 @@ class IdentityTab(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.container = QWidget()
+        self.container.setStyleSheet("background-color: #1e1e2e;")
         self.grid = QGridLayout(self.container)
         self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll)
@@ -670,26 +666,6 @@ class IdentityTab(QWidget):
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if confirm == QMessageBox.StandardButton.Yes:
             self.db.delete_identity(iid)
-            self.main_app.refresh_all_grids()
-            
-    def open_video_processor(self):
-        msgBox = QMessageBox(self)
-        msgBox.setWindowTitle("Process Faces")
-        msgBox.setText("Where would you like to process faces from?")
-        btn_file = msgBox.addButton("Video File", QMessageBox.ButtonRole.ActionRole)
-        btn_cam = msgBox.addButton("Live Camera", QMessageBox.ButtonRole.ActionRole)
-        msgBox.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        msgBox.exec()
-        
-        if msgBox.clickedButton() == btn_file:
-            file_path, _ = QFileDialog.getOpenFileName(self, "Select Video File", "", "Video Files (*.mp4 *.avi *.mkv *.mov)")
-            if file_path:
-                dlg = VideoProcessorDialog(file_path, self.main_app.face_processor, self.db, self)
-                dlg.exec()
-                self.main_app.refresh_all_grids()
-        elif msgBox.clickedButton() == btn_cam:
-            dlg = VideoProcessorDialog(0, self.main_app.face_processor, self.db, self)
-            dlg.exec()
             self.main_app.refresh_all_grids()
 
 import os
@@ -1211,102 +1187,7 @@ class HybridCaptureThread(QThread):
         self.running_capture = False
         self.wait()
 
-class HybridCaptureTab(QWidget):
-    def __init__(self, main_app):
-        super().__init__()
-        self.main_app = main_app
-        layout = QVBoxLayout(self)
-        
-        self.video_label = QLabel("Camera Offline. Click Start Detection & Capture.")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.video_label.setStyleSheet("background-color: black; border-radius: 10px; font-size: 18px;")
-        layout.addWidget(self.video_label, stretch=1)
-        
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
-        self.progress.hide()
-        layout.addWidget(self.progress)
-        
-        self.log_widget = QListWidget()
-        self.log_widget.setFixedHeight(100)
-        self.log_widget.hide()
-        layout.addWidget(self.log_widget)
-        
-        self.btn_toggle = QPushButton("Start Detection & Capture")
-        self.btn_toggle.setObjectName("success")
-        self.btn_toggle.clicked.connect(self.toggle_capture)
-        layout.addWidget(self.btn_toggle, alignment=Qt.AlignmentFlag.AlignCenter)
-        
-        self.thread = None
-        
-    def update_hybrid_image(self, cv_img, display_data):
-        frame = cv2.flip(cv_img, 1)
-        h, w, ch = frame.shape
-        for res in display_data:
-            box = res['box']
-            name = res['name']
-            category = res['category']
-            
-            x1 = w - box[2]
-            x2 = w - box[0]
-            y1 = box[1]
-            y2 = box[3]
-            
-            if category == 'VIP':
-                color = (0, 255, 0)
-            elif category == 'Blacklist':
-                color = (0, 0, 255)
-            else:
-                color = (128, 128, 128)
-                
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            label_text = f"{name} ({category})"
-            cv2.putText(frame, label_text, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        p = convert_to_Qt_format.scaled(self.video_label.width(), self.video_label.height(), Qt.AspectRatioMode.KeepAspectRatio)
-        self.video_label.setPixmap(QPixmap.fromImage(p))
-        
-    def toggle_capture(self):
-        if self.thread and self.thread.isRunning():
-            if self.thread.running_capture:
-                # Stop capture and start aggregation
-                self.btn_toggle.setText("Aggregating Data (Please wait...)")
-                self.btn_toggle.setEnabled(False)
-                self.progress.show()
-                self.progress.setRange(0, 0)
-                self.log_widget.show()
-                self.thread.stop_capture()
-        else:
-            self.thread = HybridCaptureThread(self.main_app.face_processor, self.main_app.db)
-            self.thread.frame_ready.connect(self.update_hybrid_image)
-            self.thread.progress.connect(self.progress.setValue)
-            self.thread.log.connect(self.log_widget.addItem)
-            self.thread.finished_processing.connect(self.on_finished)
-            self.thread.start()
-            self.log_widget.clear()
-            self.log_widget.hide()
-            self.progress.hide()
-            self.btn_toggle.setText("Finish & Save Data")
-            self.btn_toggle.setObjectName("danger")
-            self.btn_toggle.setStyleSheet("")
-            
-    def on_finished(self):
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100)
-        self.btn_toggle.setEnabled(True)
-        self.btn_toggle.setText("Start Detection & Capture")
-        self.btn_toggle.setObjectName("success")
-        self.btn_toggle.setStyleSheet("")
-        self.main_app.refresh_all_grids()
-        
-    def stop(self):
-        if self.thread and self.thread.isRunning():
-            self.thread.hard_stop()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1322,40 +1203,78 @@ class MainWindow(QMainWindow):
         
         # Stop CV backend until Live Monitor tab opens
         self.video_thread = None
+        self.hybrid_thread = None
 
     def init_ui(self):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         
-        # Tab 1: Live Monitor
+        # --- TAB 1: Live Stream ---
         self.live_tab = QWidget()
         live_layout = QVBoxLayout(self.live_tab)
         
-        self.video_label = QLabel("Camera Offline. Click Start Stream.")
+        self.video_label = QLabel("Camera Offline. Select an option below to start.")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.video_label.setStyleSheet("background-color: black; border-radius: 10px; font-size: 18px;")
         live_layout.addWidget(self.video_label, stretch=1)
         
-        self.btn_toggle_cam = QPushButton("Start Stream")
+        live_btn_layout = QHBoxLayout()
+        self.btn_toggle_cam = QPushButton("Start Detection Only")
         self.btn_toggle_cam.setObjectName("success")
         self.btn_toggle_cam.clicked.connect(self.toggle_camera)
-        live_layout.addWidget(self.btn_toggle_cam, alignment=Qt.AlignmentFlag.AlignCenter)
         
-        self.tabs.addTab(self.live_tab, "Live Monitor")
+        self.btn_toggle_hybrid = QPushButton("Start Detection + Capture")
+        self.btn_toggle_hybrid.setObjectName("secondary")
+        self.btn_toggle_hybrid.clicked.connect(self.toggle_hybrid_capture)
         
-        self.hybrid_tab = HybridCaptureTab(self)
-        self.tabs.addTab(self.hybrid_tab, "Detection + Capture")
+        live_btn_layout.addWidget(self.btn_toggle_cam)
+        live_btn_layout.addWidget(self.btn_toggle_hybrid)
+        live_layout.addLayout(live_btn_layout)
         
-        # Tab 2: Identity Management
+        # Progress and logs for Hybrid mode
+        self.hybrid_progress = QProgressBar()
+        self.hybrid_progress.setRange(0, 0)
+        self.hybrid_progress.hide()
+        live_layout.addWidget(self.hybrid_progress)
+        
+        self.hybrid_log = QListWidget()
+        self.hybrid_log.setFixedHeight(100)
+        self.hybrid_log.hide()
+        live_layout.addWidget(self.hybrid_log)
+        
+        self.tabs.addTab(self.live_tab, "Live Recognition")
+        
+        # --- TAB 2: Batch Processing ---
+        self.batch_tab = QWidget()
+        batch_layout = QVBoxLayout(self.batch_tab)
+        batch_layout.addWidget(QLabel("<h2>Batch Video/Camera Face Processing</h2>"), alignment=Qt.AlignmentFlag.AlignCenter)
+        lbl_desc = QLabel("Process pre-recorded videos or batch capture from the live camera to identify subjects and automatically add unknown faces to the database.")
+        lbl_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_desc.setStyleSheet("color: #a6adc8; font-size: 14px;")
+        batch_layout.addWidget(lbl_desc)
+        batch_layout.addStretch()
+        
+        self.btn_batch = QPushButton("Start Batch Processing")
+        self.btn_batch.setStyleSheet("background-color: #f9e2af; color: #11111b; font-weight: bold; padding: 15px 25px; border-radius: 5px; font-size: 16px;")
+        self.btn_batch.clicked.connect(self.open_video_processor)
+        batch_layout.addWidget(self.btn_batch, alignment=Qt.AlignmentFlag.AlignCenter)
+        batch_layout.addStretch()
+        self.tabs.addTab(self.batch_tab, "Batch Processing")
+        
+        # --- TAB 3: Database Management ---
+        self.db_tab = QWidget()
+        db_layout = QVBoxLayout(self.db_tab)
+        self.db_subtabs = QTabWidget()
+        db_layout.addWidget(self.db_subtabs)
+        
         self.identities_tab = IdentityTab(self, filter_categories=["VIP", "Blacklist"])
-        self.tabs.addTab(self.identities_tab, "Identities & Configuration")
+        self.db_subtabs.addTab(self.identities_tab, "Registered Identities")
         
-        # Tab 3: Unknown Personalities
         self.unknowns_tab = IdentityTab(self, filter_categories=["Unknown"])
-        self.tabs.addTab(self.unknowns_tab, "Unknown Personalities")
-
-        # Detection Logs Tab
+        self.db_subtabs.addTab(self.unknowns_tab, "Unknown Personalities")
+        
+        # Logs tab inside DB
         self.log_tab = QWidget()
         self.log_layout = QVBoxLayout(self.log_tab)
         
@@ -1391,7 +1310,9 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_clear_logs)
         self.log_layout.addLayout(btn_layout)
         
-        self.tabs.addTab(self.log_tab, "Detection Logs")
+        self.db_subtabs.addTab(self.log_tab, "Detection Logs")
+        
+        self.tabs.addTab(self.db_tab, "Database Management")
         
         self.refresh_logs()
         
@@ -1438,12 +1359,16 @@ class MainWindow(QMainWindow):
         self.refresh_logs()
 
     def toggle_camera(self):
+        if self.hybrid_thread and self.hybrid_thread.isRunning():
+            self.toggle_hybrid_capture()
         if self.video_thread and self.video_thread.isRunning():
             self.video_thread.stop()
             self.video_thread = None
-            self.btn_toggle_cam.setText("Start Stream")
+            self.btn_toggle_cam.setText("Start Detection Only")
             self.btn_toggle_cam.setObjectName("success")
-            self.btn_toggle_cam.setStyleSheet("") # trick to reappply qss
+            self.btn_toggle_cam.setStyleSheet("")
+            self.btn_toggle_cam.setEnabled(True)
+            self.btn_toggle_hybrid.setEnabled(True)
             self.video_label.clear()
             self.video_label.setText("Camera Offline.")
         else:
@@ -1451,9 +1376,67 @@ class MainWindow(QMainWindow):
             self.video_thread.frame_ready.connect(self.update_image)
             self.video_thread.log_updated.connect(self.refresh_logs)
             self.video_thread.start()
-            self.btn_toggle_cam.setText("Stop Stream")
+            self.btn_toggle_cam.setText("Stop Detection")
             self.btn_toggle_cam.setObjectName("danger")
             self.btn_toggle_cam.setStyleSheet("")
+            self.btn_toggle_hybrid.setEnabled(False)
+
+    def toggle_hybrid_capture(self):
+        if self.video_thread and self.video_thread.isRunning():
+            self.toggle_camera()
+        if self.hybrid_thread and self.hybrid_thread.isRunning():
+            if self.hybrid_thread.running_capture:
+                # Stop capture and start aggregation
+                self.btn_toggle_hybrid.setText("Aggregating Data...")
+                self.btn_toggle_hybrid.setEnabled(False)
+                self.hybrid_progress.show()
+                self.hybrid_progress.setRange(0, 0)
+                self.hybrid_log.show()
+                self.hybrid_thread.stop_capture()
+        else:
+            self.hybrid_thread = HybridCaptureThread(self.face_processor, self.db)
+            self.hybrid_thread.frame_ready.connect(self.update_image)
+            self.hybrid_thread.progress.connect(self.hybrid_progress.setValue)
+            self.hybrid_thread.log.connect(self.hybrid_log.addItem)
+            self.hybrid_thread.finished_processing.connect(self.on_hybrid_finished)
+            self.hybrid_thread.start()
+            self.hybrid_log.clear()
+            self.hybrid_log.hide()
+            self.hybrid_progress.hide()
+            self.btn_toggle_hybrid.setText("Finish & Save Data")
+            self.btn_toggle_hybrid.setObjectName("danger")
+            self.btn_toggle_hybrid.setStyleSheet("")
+            self.btn_toggle_cam.setEnabled(False)
+            
+    def on_hybrid_finished(self):
+        self.hybrid_progress.setRange(0, 100)
+        self.hybrid_progress.setValue(100)
+        self.btn_toggle_hybrid.setEnabled(True)
+        self.btn_toggle_hybrid.setText("Start Detection + Capture")
+        self.btn_toggle_hybrid.setObjectName("secondary")
+        self.btn_toggle_hybrid.setStyleSheet("")
+        self.btn_toggle_cam.setEnabled(True)
+        self.refresh_all_grids()
+
+    def open_video_processor(self):
+        msgBox = QMessageBox(self)
+        msgBox.setWindowTitle("Process Faces")
+        msgBox.setText("Where would you like to process faces from?")
+        btn_file = msgBox.addButton("Video File", QMessageBox.ButtonRole.ActionRole)
+        btn_cam = msgBox.addButton("Live Camera", QMessageBox.ButtonRole.ActionRole)
+        msgBox.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msgBox.exec()
+        
+        if msgBox.clickedButton() == btn_file:
+            file_path, _ = QFileDialog.getOpenFileName(self, "Select Video File", "", "Video Files (*.mp4 *.avi *.mkv *.mov)")
+            if file_path:
+                dlg = VideoProcessorDialog(file_path, self.face_processor, self.db, self)
+                dlg.exec()
+                self.refresh_all_grids()
+        elif msgBox.clickedButton() == btn_cam:
+            dlg = VideoProcessorDialog(0, self.face_processor, self.db, self)
+            dlg.exec()
+            self.refresh_all_grids()
 
     def update_image(self, cv_img, display_data):
         frame = cv2.flip(cv_img, 1) # Flip image first so text renders correctly
@@ -1499,8 +1482,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.video_thread and self.video_thread.isRunning():
             self.video_thread.stop()
-        if hasattr(self, 'hybrid_tab'):
-            self.hybrid_tab.stop()
+        if self.hybrid_thread and self.hybrid_thread.isRunning():
+            self.hybrid_thread.hard_stop()
         event.accept()
 
 if __name__ == '__main__':
